@@ -39,6 +39,7 @@ from .tuners import (
     PrefixEncoder,
     PromptEmbedding,
     PromptEncoder,
+    PromptEmbeddingLoRA
 )
 from .utils import (
     SAFETENSORS_WEIGHTS_NAME,
@@ -65,6 +66,7 @@ PEFT_TYPE_TO_MODEL_MAPPING = {
     PeftType.PREFIX_TUNING: PrefixEncoder,
     PeftType.ADALORA: AdaLoraModel,
     PeftType.ADAPTION_PROMPT: AdaptionPromptModel,
+    PeftType.PROMPT_TUNING_LORA: PromptEmbeddingLoRA,
 }
 
 
@@ -227,6 +229,8 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
 
         if config.peft_type == PeftType.PROMPT_TUNING:
             prompt_encoder = PromptEmbedding(config, self.word_embeddings)
+        elif config.peft_type == PeftType.PROMPT_TUNING_LORA:
+            prompt_encoder = PromptEmbeddingLoRA(config, self.word_embeddings)
         elif config.peft_type == PeftType.P_TUNING:
             prompt_encoder = PromptEncoder(config)
         elif config.peft_type == PeftType.PREFIX_TUNING:
@@ -1109,6 +1113,35 @@ class PeftModelForSeq2SeqLM(PeftModel):
 
                     input_ids = kwargs.pop("input_ids")
                     inputs_embeds = self.word_embeddings(input_ids)
+                    batch_size = inputs_embeds.shape[0]
+                    prompts = self.get_prompt(batch_size=batch_size)
+                    prompts = prompts.to(inputs_embeds.dtype)
+                    generation_inputs = torch.cat((prompts[:, : peft_config.num_virtual_tokens], inputs_embeds), dim=1)
+                    kwargs["inputs_embeds"] = generation_inputs
+
+                    if "attention_mask" in kwargs:
+                        prefix_attention_mask = torch.ones(batch_size, peft_config.num_virtual_tokens).to(
+                            kwargs["attention_mask"].device
+                        )
+                        kwargs["attention_mask"] = torch.cat((prefix_attention_mask, kwargs["attention_mask"]), dim=1)
+
+                    return self.base_model.generate(**kwargs)
+                elif peft_config.peft_type == PeftType.PROMPT_TUNING_LORA:
+                    kwargs = deepcopy(kwargs)
+
+                    if "encoder_outputs" in kwargs:
+                        del kwargs["encoder_ouputs"]
+                        warnings.warn(
+                            "`encoder_outputs` should not be passed to `generate` when using prompt tuning. Ignoring it."
+                        )
+
+                    input_ids = kwargs.pop("input_ids")
+                    inputs_embeds = self.word_embeddings(input_ids)
+                    lora_embedding_A = self.prompt_encoder[self.active_adapter].lora_embedding_A.weight
+                    lora_embedding_B = self.prompt_encoder[self.active_adapter].lora_embedding_B.weight
+                    scaling = self.prompt_encoder[self.active_adapter].scaling
+                    inputs_embeds += scaling * (lora_embedding_A @ lora_embedding_B)
+                    
                     batch_size = inputs_embeds.shape[0]
                     prompts = self.get_prompt(batch_size=batch_size)
                     prompts = prompts.to(inputs_embeds.dtype)
